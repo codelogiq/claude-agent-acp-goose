@@ -977,19 +977,19 @@ export class ClaudeAcpAgent {
                     const q = questions[i];
                     const customVal = action.content[`question_${i}_custom`];
                     const val = action.content[`question_${i}`];
-                    // Custom write-in takes priority over radio/checkbox selection
-                    if (customVal != null && String(customVal).trim() !== '') {
-                        answers[q.question] = String(customVal);
-                    }
-                    else if (Array.isArray(val)) {
-                        answers[q.question] = val.join(', ');
+                    const parts = [];
+                    // Collect checkbox/radio selections
+                    if (Array.isArray(val) && val.length > 0) {
+                        parts.push(val.join(', '));
                     }
                     else if (val != null && String(val).trim() !== '') {
-                        answers[q.question] = String(val);
+                        parts.push(String(val));
                     }
-                    else {
-                        answers[q.question] = '';
+                    // Append custom write-in (combines with selections, not replaces)
+                    if (customVal != null && String(customVal).trim() !== '') {
+                        parts.push(String(customVal));
                     }
+                    answers[q.question] = parts.join(', ');
                 }
                 return {
                     behavior: 'allow',

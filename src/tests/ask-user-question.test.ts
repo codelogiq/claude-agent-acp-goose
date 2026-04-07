@@ -153,6 +153,33 @@ describe("AskUserQuestion → session/elicitation bridge", () => {
   });
 
   describe("D-05: Response mapping — ACP Elicitation → Claude answers", () => {
+    // Helper that mirrors the actual merge logic in handleAskUserQuestion
+    function mapResponses(
+      questions: Array<{ question: string; header: string; options: Array<{ label: string; description: string }>; multiSelect: boolean }>,
+      content: Record<string, unknown>,
+    ): Record<string, string> {
+      const answers: Record<string, string> = {};
+      for (let i = 0; i < questions.length; i++) {
+        const q = questions[i];
+        const customVal = content[`question_${i}_custom`];
+        const val = content[`question_${i}`];
+        const parts: string[] = [];
+
+        if (Array.isArray(val) && val.length > 0) {
+          parts.push(val.join(", "));
+        } else if (val != null && String(val).trim() !== "") {
+          parts.push(String(val));
+        }
+
+        if (customVal != null && String(customVal).trim() !== "") {
+          parts.push(String(customVal));
+        }
+
+        answers[q.question] = parts.join(", ");
+      }
+      return answers;
+    }
+
     it("maps accepted response to answers keyed by question TEXT (Pitfall 1)", () => {
       const questions = [
         {
@@ -163,20 +190,7 @@ describe("AskUserQuestion → session/elicitation bridge", () => {
         },
       ];
       const content: Record<string, unknown> = { question_0: "A", question_0_custom: "" };
-      const answers: Record<string, string> = {};
-
-      for (let i = 0; i < questions.length; i++) {
-        const q = questions[i];
-        const customVal = content[`question_${i}_custom`];
-        const val = content[`question_${i}`];
-        if (customVal != null && String(customVal).trim() !== "") {
-          answers[q.question] = String(customVal);
-        } else if (val != null && String(val).trim() !== "") {
-          answers[q.question] = String(val);
-        } else {
-          answers[q.question] = "";
-        }
-      }
+      const answers = mapResponses(questions, content);
 
       // Key is "Which library?" not "question_0"
       expect(answers).toHaveProperty("Which library?");
@@ -184,7 +198,7 @@ describe("AskUserQuestion → session/elicitation bridge", () => {
       expect(answers).not.toHaveProperty("question_0");
     });
 
-    it("custom write-in takes priority over radio selection", () => {
+    it("custom write-in combines with radio selection", () => {
       const questions = [
         {
           question: "Which library?",
@@ -194,20 +208,22 @@ describe("AskUserQuestion → session/elicitation bridge", () => {
         },
       ];
       const content: Record<string, unknown> = { question_0: "A", question_0_custom: "My custom answer" };
-      const answers: Record<string, string> = {};
+      const answers = mapResponses(questions, content);
 
-      for (let i = 0; i < questions.length; i++) {
-        const q = questions[i];
-        const customVal = content[`question_${i}_custom`];
-        const val = content[`question_${i}`];
-        if (customVal != null && String(customVal).trim() !== "") {
-          answers[q.question] = String(customVal);
-        } else if (val != null && String(val).trim() !== "") {
-          answers[q.question] = String(val);
-        } else {
-          answers[q.question] = "";
-        }
-      }
+      expect(answers["Which library?"]).toBe("A, My custom answer");
+    });
+
+    it("custom write-in alone works when no selection made", () => {
+      const questions = [
+        {
+          question: "Which library?",
+          header: "",
+          options: [{ label: "A", description: "" }],
+          multiSelect: false,
+        },
+      ];
+      const content: Record<string, unknown> = { question_0: "", question_0_custom: "My custom answer" };
+      const answers = mapResponses(questions, content);
 
       expect(answers["Which library?"]).toBe("My custom answer");
     });
@@ -222,17 +238,24 @@ describe("AskUserQuestion → session/elicitation bridge", () => {
         },
       ];
       const content: Record<string, unknown> = { question_0: ["Auth", "DB", "Cache"] };
-      const answers: Record<string, string> = {};
-
-      for (let i = 0; i < questions.length; i++) {
-        const q = questions[i];
-        const val = content[`question_${i}`];
-        if (Array.isArray(val)) {
-          answers[q.question] = val.join(", ");
-        }
-      }
+      const answers = mapResponses(questions, content);
 
       expect(answers["Features?"]).toBe("Auth, DB, Cache");
+    });
+
+    it("multi-select values combine with custom write-in", () => {
+      const questions = [
+        {
+          question: "Features?",
+          header: "",
+          options: [{ label: "Auth", description: "" }, { label: "DB", description: "" }],
+          multiSelect: true,
+        },
+      ];
+      const content: Record<string, unknown> = { question_0: ["Auth", "DB"], question_0_custom: "Also need caching" };
+      const answers = mapResponses(questions, content);
+
+      expect(answers["Features?"]).toBe("Auth, DB, Also need caching");
     });
   });
 
@@ -364,13 +387,19 @@ describe("AskUserQuestion → session/elicitation bridge", () => {
         const q = questions[i];
         const customVal = content[`question_${i}_custom`];
         const val = content[`question_${i}`];
-        if (customVal != null && String(customVal).trim() !== "") {
-          answers[q.question] = String(customVal);
+        const parts: string[] = [];
+
+        if (Array.isArray(val) && val.length > 0) {
+          parts.push(val.join(", "));
         } else if (val != null && String(val).trim() !== "") {
-          answers[q.question] = String(val);
-        } else {
-          answers[q.question] = "";
+          parts.push(String(val));
         }
+
+        if (customVal != null && String(customVal).trim() !== "") {
+          parts.push(String(customVal));
+        }
+
+        answers[q.question] = parts.join(", ");
       }
 
       expect(answers["Q?"]).toBe("");
