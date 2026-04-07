@@ -383,7 +383,11 @@ export class ClaudeAcpAgent implements Agent {
           list: {},
           resume: {},
           close: {},
-        },
+          // D-06: Advertise elicitation support for AskUserQuestion bridge
+          elicitation: {
+            form: {},
+          },
+        } as any,
       },
       agentInfo: {
         name: packageJson.name,
@@ -616,9 +620,22 @@ export class ClaudeAcpAgent implements Agent {
               case "task_started":
               case "task_notification":
               case "task_progress":
-              case "elicitation_complete":
               case "api_retry":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
+                break;
+              case "elicitation_complete":
+                // D-07: Forward elicitation_complete as session update
+                try {
+                  await this.client.sessionUpdate({
+                    sessionId: message.session_id,
+                    update: {
+                      sessionUpdate: "elicitation_complete",
+                      elicitationId: (message as any).elicitation_id,
+                    } as any,
+                  });
+                } catch (err) {
+                  this.logger.error('Failed to forward elicitation_complete:', err);
+                }
                 break;
               default:
                 unreachable(message, this.logger);
@@ -1099,6 +1116,11 @@ export class ClaudeAcpAgent implements Agent {
         };
       }
 
+      // AskUserQuestion bridge: intercept and route to session/elicitation (D-05)
+      if (toolName === 'AskUserQuestion') {
+        return this.handleAskUserQuestion(sessionId, toolInput, signal);
+      }
+
       if (toolName === "ExitPlanMode") {
         const options = [
           {
@@ -1228,6 +1250,144 @@ export class ClaudeAcpAgent implements Agent {
         };
       }
     };
+  }
+
+  /**
+   * Bridge AskUserQuestion tool to ACP session/elicitation primitive.
+   * Maps Claude's question format to ACP ElicitationRequest schema,
+   * sends to client, then maps the response back to AskUserQuestion answers.
+   */
+  private async handleAskUserQuestion(
+    sessionId: string,
+    toolInput: Record<string, unknown>,
+    signal: AbortSignal,
+  ): Promise<{ behavior: 'allow'; updatedInput: Record<string, unknown> }> {
+    // D-08: Fallback when client lacks elicitation capability
+    if (!this.clientCapabilities?.elicitation?.form) {
+      return {
+        behavior: 'allow',
+        updatedInput: { ...toolInput, answers: {} },
+      };
+    }
+
+    const questions = toolInput.questions as Array<{
+      question: string;
+      header: string;
+      options: Array<{ label: string; description: string; preview?: string }>;
+      multiSelect: boolean;
+    }>;
+
+    // Build ACP ElicitationRequest schema from Claude's question format
+    const properties: Record<string, unknown> = {};
+    const required: string[] = [];
+    const messageLines: string[] = [];
+
+    for (let i = 0; i < questions.length; i++) {
+      const q = questions[i];
+      const fieldKey = `question_${i}`;
+
+      if (q.header) messageLines.push(`**${q.header}**`);
+      if (i === 0) messageLines.push(q.question);
+
+      if (q.options && q.options.length > 0) {
+        if (q.multiSelect) {
+          // Multi-select: enum + multiple flag for ElicitationCard checkboxes
+          // Uses { type: 'string', enum, multiple: true } NOT { type: 'array' }
+          // to match Goose ElicitationCard convention
+          properties[fieldKey] = {
+            type: 'string',
+            title: q.question,
+            enum: q.options.map((opt) => opt.label),
+            multiple: true,
+          };
+        } else {
+          // Single-select: oneOf for ElicitationCard radio buttons with descriptions
+          properties[fieldKey] = {
+            type: 'string',
+            title: q.question,
+            oneOf: q.options.map((opt) => ({
+              const: opt.label,
+              title: opt.label,
+              description: opt.description,
+            })),
+          };
+        }
+        // Free-text write-in field alongside options
+        properties[`${fieldKey}_custom`] = {
+          type: 'string',
+          title: 'Or type your own answer',
+        };
+      } else {
+        // Free-text only question (no predefined options)
+        properties[fieldKey] = {
+          type: 'string',
+          title: q.question,
+        };
+        required.push(fieldKey);
+      }
+    }
+
+    const elicitationRequest = {
+      message: messageLines.join('\n') || questions[0]?.question || 'Agent has a question',
+      mode: 'form' as const,
+      sessionId,
+      requestedSchema: {
+        type: 'object' as const,
+        properties,
+        required,
+      },
+    };
+
+    try {
+      // Call ACP session/elicitation — routes to GooseAcpClient.extMethod()
+      const response = await this.client.extMethod(
+        'session/elicitation',
+        elicitationRequest as any,
+      );
+      // Response is flat: { action: 'accept', content?: {...} } | { action: 'decline' } | { action: 'cancel' }
+      const action = response as unknown as
+        | { action: 'accept'; content?: Record<string, unknown> }
+        | { action: 'decline' }
+        | { action: 'cancel' };
+
+      if (action.action === 'accept' && action.content) {
+        // Map form responses back to AskUserQuestion answers format
+        // CRITICAL: answers keyed by question TEXT, not field names (Pitfall 1)
+        const answers: Record<string, string> = {};
+        for (let i = 0; i < questions.length; i++) {
+          const q = questions[i];
+          const customVal = action.content[`question_${i}_custom`];
+          const val = action.content[`question_${i}`];
+          // Custom write-in takes priority over radio/checkbox selection
+          if (customVal != null && String(customVal).trim() !== '') {
+            answers[q.question] = String(customVal);
+          } else if (Array.isArray(val)) {
+            answers[q.question] = val.join(', ');
+          } else if (val != null && String(val).trim() !== '') {
+            answers[q.question] = String(val);
+          } else {
+            answers[q.question] = '';
+          }
+        }
+        return {
+          behavior: 'allow',
+          updatedInput: { ...toolInput, answers },
+        };
+      }
+
+      // D-09: Decline or cancel — return empty answers (never deny)
+      return {
+        behavior: 'allow',
+        updatedInput: { ...toolInput, answers: {} },
+      };
+    } catch (err) {
+      // Elicitation failed (IPC error, timeout, etc.) — fall back to empty answers
+      this.logger.error('AskUserQuestion elicitation failed:', err);
+      return {
+        behavior: 'allow',
+        updatedInput: { ...toolInput, answers: {} },
+      };
+    }
   }
 
   private async sendAvailableCommandsUpdate(sessionId: string): Promise<void> {
@@ -1392,8 +1552,8 @@ export class ClaudeAcpAgent implements Agent {
       ? parseInt(process.env.MAX_THINKING_TOKENS, 10)
       : undefined;
 
-    // Disable this for now, not a great way to expose this over ACP at the moment (in progress work so we can revisit)
-    const disallowedTools = ["AskUserQuestion"];
+    // AskUserQuestion is now handled via session/elicitation bridge in canUseTool (D-04)
+    const disallowedTools: string[] = [];
 
     // Resolve which built-in tools to expose.
     // Explicit tools array from _meta.claudeCode.options takes precedence.
