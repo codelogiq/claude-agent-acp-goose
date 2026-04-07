@@ -1,5 +1,5 @@
 node_modules
-dist
+# dist/ is NOT gitignored — git URL consumers need built output (Pitfall 6)
 .DS_Store
 .claude/*.local.*
 CLAUDE.local.md
